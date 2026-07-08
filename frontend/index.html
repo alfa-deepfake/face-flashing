@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Face Flashing MVP</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: radial-gradient(circle at top, #222 0, #050505 52%, #000 100%);
+        color: #fff;
+      }
+
+      .app {
+        min-height: 100vh;
+        display: grid;
+        grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+        gap: 24px;
+        padding: 32px;
+      }
+
+      .panel {
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 28px;
+        background: rgba(8, 8, 12, 0.82);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+        overflow: hidden;
+      }
+
+      .camera {
+        position: relative;
+        min-height: 560px;
+        display: grid;
+        place-items: center;
+        background: #000;
+      }
+
+      video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        transform: scaleX(-1);
+      }
+
+      .face-guide {
+        position: absolute;
+        width: 230px;
+        height: 310px;
+        border: 2px solid rgba(52, 211, 153, 0.9);
+        border-radius: 48%;
+        box-shadow: 0 0 48px rgba(52, 211, 153, 0.25);
+        pointer-events: none;
+      }
+
+      .side {
+        padding: 28px;
+      }
+
+      h1 {
+        margin: 0 0 10px;
+        font-size: 28px;
+      }
+
+      p {
+        color: #a1a1aa;
+        line-height: 1.6;
+      }
+
+      button {
+        border: 0;
+        border-radius: 14px;
+        padding: 13px 18px;
+        background: #8b5cf6;
+        color: white;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      .secondary {
+        background: rgba(255, 255, 255, 0.1);
+      }
+
+      .actions {
+        display: flex;
+        gap: 12px;
+        margin-top: 22px;
+      }
+
+      progress {
+        width: 100%;
+        height: 12px;
+        margin-top: 18px;
+      }
+
+      .result {
+        margin-top: 22px;
+        border-radius: 18px;
+        padding: 16px;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+      }
+
+      .metrics {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        margin-top: 14px;
+      }
+
+      .metric {
+        padding: 12px;
+        border-radius: 14px;
+        background: rgba(0, 0, 0, 0.35);
+      }
+
+      .metric small {
+        display: block;
+        color: #71717a;
+      }
+
+      .flash {
+        position: fixed;
+        inset: 0;
+        z-index: 20;
+        pointer-events: none;
+        display: none;
+        background: #000;
+        opacity: 1;
+        transition: none;
+      }
+
+      .camera-pip {
+        position: fixed;
+        right: 20px;
+        bottom: 20px;
+        z-index: 30;
+        width: 168px;
+        height: 126px;
+        border-radius: 16px;
+        overflow: hidden;
+        border: 2px solid rgba(255, 255, 255, 0.85);
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+        background: #000;
+        pointer-events: none;
+      }
+
+      .camera-pip video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        transform: scaleX(-1);
+      }
+
+      .camera-pip[hidden] {
+        display: none;
+      }
+
+      .error {
+        margin-top: 16px;
+        color: #fecdd3;
+      }
+
+      @media (max-width: 900px) {
+        .app {
+          grid-template-columns: 1fr;
+          padding: 16px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="flash" class="flash"></div>
+    <div id="cameraPip" class="camera-pip" hidden>
+      <video id="pipVideo" autoplay muted playsinline></video>
+    </div>
+    <main class="app">
+      <section class="panel camera">
+        <video id="video" autoplay muted playsinline></video>
+        <div class="face-guide"></div>
+        <canvas id="canvas" hidden></canvas>
+      </section>
+
+      <aside class="panel side">
+        <h1>Face Flashing MVP</h1>
+        <p>
+          Нажми старт, дай доступ к камере, смотри в экран. Сайт покажет случайные
+          яркие вспышки, сервер проверит отклик лица и вернет вероятность подделки.
+        </p>
+
+        <div class="actions">
+          <button id="start">Начать проверку</button>
+          <button id="reset" class="secondary">Сброс</button>
+        </div>
+
+        <progress id="progress" value="0" max="100"></progress>
+        <p id="status">Готово к запуску</p>
+        <p id="error" class="error"></p>
+
+        <div id="result" class="result" hidden></div>
+      </aside>
+    </main>
+
+    <script>
+      const video = document.getElementById("video");
+      const pipVideo = document.getElementById("pipVideo");
+      const cameraPip = document.getElementById("cameraPip");
+      const canvas = document.getElementById("canvas");
+      const flash = document.getElementById("flash");
+      const startButton = document.getElementById("start");
+      const resetButton = document.getElementById("reset");
+      const statusEl = document.getElementById("status");
+      const errorEl = document.getElementById("error");
+      const progressEl = document.getElementById("progress");
+      const resultEl = document.getElementById("result");
+
+      let stream = null;
+      let socket = null;
+      let captureTimer = null;
+      let raf = 0;
+      let sessionFinished = false;
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function totalDuration(session) {
+        const last = session.challenge.at(-1);
+        return last ? last.offset_ms + last.duration_ms + 800 : session.baseline_ms;
+      }
+
+      async function startCamera() {
+        if (stream) {
+          video.srcObject = stream;
+          pipVideo.srcObject = stream;
+          cameraPip.hidden = false;
+          await video.play().catch(() => undefined);
+          await pipVideo.play().catch(() => undefined);
+          return;
+        }
+
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+        });
+        video.srcObject = stream;
+        pipVideo.srcObject = stream;
+        cameraPip.hidden = false;
+        await video.play();
+        await pipVideo.play();
+      }
+
+      function stopCamera() {
+        if (!stream) return;
+        for (const track of stream.getTracks()) {
+          track.stop();
+        }
+        stream = null;
+        video.srcObject = null;
+        pipVideo.srcObject = null;
+        cameraPip.hidden = true;
+      }
+
+      function runFlashes(session, startedAt) {
+        cancelAnimationFrame(raf);
+        const tick = () => {
+          const elapsed = performance.now() - startedAt;
+          const step = session.challenge.find(
+            (item) => elapsed >= item.offset_ms && elapsed < item.offset_ms + item.duration_ms,
+          );
+
+          if (step) {
+            flash.style.display = "block";
+            flash.style.visibility = "visible";
+            flash.style.backgroundColor = step.color;
+            flash.style.opacity = "1";
+          } else {
+            flash.style.display = "none";
+            flash.style.visibility = "hidden";
+          }
+
+          if (elapsed < totalDuration(session)) {
+            raf = requestAnimationFrame(tick);
+          } else {
+            flash.style.display = "none";
+          }
+        };
+        raf = requestAnimationFrame(tick);
+      }
+
+      function startCapture(session, startedAt) {
+        const ctx = canvas.getContext("2d");
+        const intervalMs = Math.max(33, 1000 / session.frame_rate);
+        let frameIndex = 0;
+        canvas.width = session.width;
+        canvas.height = session.height;
+
+        captureTimer = setInterval(() => {
+          const elapsed = performance.now() - startedAt;
+          if (elapsed > totalDuration(session)) {
+            clearInterval(captureTimer);
+            captureTimer = null;
+            progressEl.value = 100;
+            setStatus("Анализ...");
+            socket.send(JSON.stringify({ type: "complete" }));
+            return;
+          }
+
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          socket.send(
+            JSON.stringify({
+              type: "frame",
+              session_id: session.session_id,
+              frame_index: frameIndex++,
+              elapsed_ms: elapsed,
+              client_perf_time: performance.now(),
+              image: canvas.toDataURL("image/jpeg", 0.85),
+            }),
+          );
+          progressEl.value = Math.min(100, (elapsed / totalDuration(session)) * 100);
+        }, intervalMs);
+      }
+
+      function renderResult(result) {
+        resultEl.hidden = false;
+        resultEl.innerHTML = `
+          <h2>${result.verdict.toUpperCase()}</h2>
+          <div class="metrics">
+            <div class="metric"><small>Live</small>${(result.live_probability * 100).toFixed(1)}%</div>
+            <div class="metric"><small>Spoof</small>${(result.spoof_probability * 100).toFixed(1)}%</div>
+            <div class="metric"><small>Latency</small>${result.metrics.mean_latency_ms ?? "n/a"} ms</div>
+            <div class="metric"><small>Response</small>${Number(result.metrics.response_score ?? 0).toFixed(3)}</div>
+          </div>
+          <p>${result.reasons.join(", ")}</p>
+          <details style="margin-top:12px">
+            <summary>Debug metrics</summary>
+            <pre style="white-space:pre-wrap;font-size:12px;color:#a1a1aa">${JSON.stringify(result.metrics, null, 2)}</pre>
+          </details>
+        `;
+      }
+
+      function cleanup() {
+        if (captureTimer) clearInterval(captureTimer);
+        cancelAnimationFrame(raf);
+        if (socket) socket.close();
+        captureTimer = null;
+        socket = null;
+        flash.style.display = "none";
+        cameraPip.hidden = !stream;
+        startButton.disabled = false;
+        document.exitFullscreen?.().catch(() => undefined);
+      }
+
+      startButton.addEventListener("click", async () => {
+        cleanup();
+        errorEl.textContent = "";
+        resultEl.hidden = true;
+        sessionFinished = false;
+        startButton.disabled = true;
+
+        try {
+          setStatus("Запуск камеры...");
+          await startCamera();
+          cameraPip.hidden = false;
+
+          setStatus("Создание challenge...");
+          const session = await fetch("/api/session", { method: "POST" }).then((res) => res.json());
+          const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
+          socket = new WebSocket(`${wsProtocol}://${location.host}/ws/${session.session_id}`);
+
+          socket.onmessage = (event) => {
+            const message = JSON.parse(event.data);
+            if (message.type === "result") {
+              sessionFinished = true;
+              setStatus("Готово");
+              renderResult(message.payload);
+              cleanup();
+            }
+            if (message.type === "error") {
+              errorEl.textContent = message.message || "Ошибка liveness сервиса";
+              setStatus("Ошибка");
+              cleanup();
+            }
+          };
+
+          socket.onerror = () => {
+            errorEl.textContent = "WebSocket error";
+            setStatus("Ошибка");
+            cleanup();
+          };
+
+          socket.onclose = () => {
+            if (!sessionFinished && !errorEl.textContent) {
+              errorEl.textContent = "Соединение закрыто до получения результата";
+              setStatus("Ошибка");
+              cleanup();
+            }
+          };
+
+          socket.onopen = () => {
+            const startedAt = performance.now();
+            setStatus("Идет проверка...");
+            cameraPip.hidden = false;
+            runFlashes(session, startedAt);
+            startCapture(session, startedAt);
+          };
+        } catch (error) {
+          cleanup();
+          errorEl.textContent = error instanceof Error ? error.message : String(error);
+          setStatus("Ошибка");
+        }
+      });
+
+      resetButton.addEventListener("click", () => {
+        cleanup();
+        stopCamera();
+        progressEl.value = 0;
+        resultEl.hidden = true;
+        errorEl.textContent = "";
+        setStatus("Готово к запуску");
+      });
+
+      startCamera()
+        .then(() => setStatus("Камера готова. Нажмите «Начать проверку»"))
+        .catch((error) => {
+          errorEl.textContent =
+            error instanceof Error
+              ? error.message
+              : "Не удалось получить доступ к камере. Разрешите камеру в браузере.";
+          setStatus("Нужен доступ к камере");
+        });
+    </script>
+  </body>
+</html>
