@@ -87,19 +87,6 @@ MediaPipe face model downloads automatically into `models/` (~1 MB).
 | `WS /ws/preview` | Preview: send frames, receive face bbox for overlay |
 | `WS /ws/{session_id}` | Stream frames, receive result |
 
-## Git repository
-
-From the project folder:
-
-```powershell
-git init
-git add .
-git commit -m "Initial commit: face flashing liveness MVP"
-git branch -M main
-git remote add origin https://github.com/YOUR_USER/face-flashing-mvp.git
-git push -u origin main
-```
-
 `.gitignore` excludes `.venv/`, `__pycache__/`, and downloaded `models/*.tflite`.
 
 ## Troubleshooting
