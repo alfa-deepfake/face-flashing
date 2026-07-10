@@ -271,6 +271,7 @@
       let raf = 0;
       let sessionFinished = false;
       let faceDetected = false;
+      let activeRun = false;
 
       function setStatus(text) {
         statusEl.textContent = text;
@@ -487,7 +488,9 @@
             <div class="metric"><small>Live</small>${(result.live_probability * 100).toFixed(1)}%</div>
             <div class="metric"><small>Spoof</small>${(result.spoof_probability * 100).toFixed(1)}%</div>
             <div class="metric"><small>Latency</small>${result.metrics.mean_latency_ms ?? "n/a"} ms</div>
-            <div class="metric"><small>Response</small>${Number(result.metrics.response_score ?? 0).toFixed(3)}</div>
+            <div class="metric"><small>Color match</small>${Number(result.metrics.color_match_score ?? 0).toFixed(3)}</div>
+            <div class="metric"><small>Passed flashes</small>${result.metrics.passed_flashes ?? 0}/${result.metrics.measurable_flashes ?? 0}</div>
+            <div class="metric"><small>Challenge</small>${result.metrics.challenge_passed ? "passed" : "failed"}</div>
           </div>
           <p>${result.reasons.join(", ")}</p>
           <details style="margin-top:12px">
@@ -498,6 +501,7 @@
       }
 
       function cleanup() {
+        activeRun = false;
         if (captureTimer) clearInterval(captureTimer);
         cancelAnimationFrame(raf);
         if (socket) socket.close();
@@ -507,8 +511,25 @@
         cameraPip.hidden = !stream;
         startButton.disabled = false;
         document.exitFullscreen?.().catch(() => undefined);
-        if (stream) startPreviewTracking();
+        if (stream && !document.hidden) startPreviewTracking();
       }
+
+      function abortHiddenRun() {
+        if (!activeRun) return;
+        errorEl.textContent =
+          "Проверка отменена: вкладка была скрыта или окно браузера свернуто. Оставьте страницу открытой во время вспышек.";
+        setStatus("Проверка отменена");
+        cleanup();
+      }
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+          abortHiddenRun();
+          stopPreviewTracking();
+        } else if (stream && !activeRun) {
+          startPreviewTracking();
+        }
+      });
 
       startButton.addEventListener("click", async () => {
         cleanup();
@@ -521,9 +542,11 @@
           setStatus("Запуск камеры...");
           await startCamera();
           cameraPip.hidden = false;
+          await document.documentElement.requestFullscreen?.().catch(() => undefined);
 
           setStatus("Создание challenge...");
           stopPreviewTracking();
+          activeRun = true;
           const session = await fetch("/api/session", { method: "POST" }).then((res) => res.json());
           const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
           socket = new WebSocket(`${wsProtocol}://${location.host}/ws/${session.session_id}`);

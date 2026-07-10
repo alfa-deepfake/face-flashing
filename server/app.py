@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import math
 import random
 import uuid
 from dataclasses import dataclass, field
@@ -334,49 +333,142 @@ def clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def sigmoid(value: float) -> float:
-    return 1.0 / (1.0 + math.exp(-value))
-
-
 def avg(values: list[float]) -> float:
     return float(mean(values)) if values else 0.0
 
 
-def flash_step_delta(
-    frame: Frame,
-    *,
-    base_brightness: float,
-    base_global_brightness: float,
-    base_bgr: tuple[float, float, float] | None,
-    flash_rgb: tuple[int, int, int],
-) -> float:
-    """Measure how strongly the face/frame reacted to a colored flash."""
-    if not frame.mean_bgr or not frame.mean_hsv:
-        brightness_delta = 0.0
-        channel_delta = 0.0
-        color_delta = 0.0
-    else:
-        brightness_delta = abs(frame.mean_hsv[2] - base_brightness)
-        channel_delta = max(abs(frame.mean_bgr[i] - base_bgr[i]) for i in range(3)) if base_bgr else 0.0
-        flash_bgr = (float(flash_rgb[2]), float(flash_rgb[1]), float(flash_rgb[0]))
-        color_delta = sum(
-            max(0.0, (frame.mean_bgr[i] - base_bgr[i]) * flash_bgr[i])
-            for i in range(3)
-        ) / max(sum(flash_bgr), 1.0) if base_bgr else 0.0
+def mean_bgr(frames: list[Frame]) -> np.ndarray | None:
+    values = [frame.mean_bgr for frame in frames if frame.mean_bgr is not None]
+    if not values:
+        return None
+    return np.mean(np.asarray(values, dtype=np.float64), axis=0)
 
-    global_delta = abs(frame.global_brightness - base_global_brightness)
-    relative_brightness = 0.0
-    if base_brightness > 1.0 and frame.mean_hsv:
-        relative_brightness = abs(frame.mean_hsv[2] - base_brightness) / base_brightness * 100.0
 
-    return max(brightness_delta, channel_delta, color_delta * 1.4, global_delta * 0.85, relative_brightness)
+def unit_vector(values: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(values))
+    return values / norm if norm > 1e-9 else np.zeros_like(values)
+
+
+def analyze_flash_step(face_frames: list[Frame], step: dict) -> dict:
+    """
+    Match a face color change to one exact challenge flash.
+
+    A local pre-flash baseline avoids treating slow auto-exposure drift as a
+    response. Only frames captured while the flash is visible are eligible.
+    """
+    offset = float(step["offset_ms"])
+    duration = float(step["duration_ms"])
+    pre_frames = [
+        frame
+        for frame in face_frames
+        if offset - 230.0 <= frame.elapsed_ms <= offset - 30.0
+    ]
+    flash_frames = [
+        frame
+        for frame in face_frames
+        if offset + 35.0 <= frame.elapsed_ms <= offset + duration
+    ]
+    baseline_bgr = mean_bgr(pre_frames)
+
+    if baseline_bgr is None or len(pre_frames) < 2 or len(flash_frames) < 2:
+        return {
+            "id": step["id"],
+            "passed": False,
+            "reason": "insufficient_frames",
+            "strength": 0.0,
+            "color_match": 0.0,
+            "latency_ms": None,
+        }
+
+    # Frames and OpenCV are BGR; browser challenge colors are RGB.
+    flash_rgb = np.asarray(step["rgb"], dtype=np.float64)
+    expected_bgr = flash_rgb[::-1]
+    expected_chroma = expected_bgr / max(float(expected_bgr.sum()), 1.0)
+    baseline_chroma = baseline_bgr / max(float(baseline_bgr.sum()), 1.0)
+    expected_axis = expected_chroma - baseline_chroma
+    is_white = float(np.ptp(expected_bgr)) < 25.0
+
+    candidates = []
+    for frame in flash_frames:
+        if frame.mean_bgr is None:
+            continue
+
+        current_bgr = np.asarray(frame.mean_bgr, dtype=np.float64)
+        current_chroma = current_bgr / max(float(current_bgr.sum()), 1.0)
+        observed_axis = current_chroma - baseline_chroma
+        channel_delta = current_bgr - baseline_bgr
+        brightness_rise = float(current_bgr.mean() - baseline_bgr.mean())
+
+        if is_white:
+            color_match = 1.0 if brightness_rise > 0.0 else 0.0
+            raw_strength = max(0.0, brightness_rise)
+            strength = clamp(raw_strength / 12.0)
+        else:
+            color_match = clamp(
+                (float(np.dot(unit_vector(observed_axis), unit_vector(expected_axis))) + 1.0)
+                / 2.0
+            )
+            # Remove common-mode brightness: a true colored flash must alter
+            # the channel balance, not merely trigger camera auto-exposure.
+            chromatic_delta = channel_delta - channel_delta.mean()
+            raw_strength = float(np.linalg.norm(chromatic_delta))
+            strength = clamp(raw_strength / 14.0)
+
+        evidence = strength * color_match
+        candidates.append(
+            {
+                "frame": frame,
+                "strength": strength,
+                "raw_strength": raw_strength,
+                "color_match": color_match,
+                "evidence": evidence,
+            }
+        )
+
+    if not candidates:
+        return {
+            "id": step["id"],
+            "passed": False,
+            "reason": "insufficient_frames",
+            "strength": 0.0,
+            "color_match": 0.0,
+            "latency_ms": None,
+        }
+
+    peak = max(candidates, key=lambda item: item["evidence"])
+    peak_evidence = float(peak["evidence"])
+    onset = next(
+        (
+            item
+            for item in candidates
+            if item["evidence"] >= max(0.12, peak_evidence * 0.55)
+        ),
+        peak,
+    )
+    latency_ms = max(0.0, float(onset["frame"].elapsed_ms) - offset)
+    passed = (
+        peak["strength"] >= (0.18 if is_white else 0.16)
+        and peak["color_match"] >= (0.8 if is_white else 0.72)
+        and latency_ms <= min(duration, 520.0)
+    )
+
+    return {
+        "id": step["id"],
+        "color": step["color"],
+        "passed": passed,
+        "reason": "matched" if passed else "weak_or_wrong_color",
+        "strength": round(float(peak["strength"]), 4),
+        "raw_strength": round(float(peak["raw_strength"]), 4),
+        "color_match": round(float(peak["color_match"]), 4),
+        "latency_ms": round(latency_ms, 1),
+        "is_white": is_white,
+    }
 
 
 def score(session: Session) -> dict:
     frames = sorted(session.frames, key=lambda item: item.elapsed_ms)
     total = len(frames)
     face_frames = [frame for frame in frames if frame.face_found]
-    baseline = [frame for frame in face_frames if frame.elapsed_ms <= session.baseline_ms]
 
     if total < 20:
         return result(session, "uncertain", 0.2, ["too_few_frames"], {"total_frames": total})
@@ -384,115 +476,72 @@ def score(session: Session) -> dict:
     face_ratio = len(face_frames) / total
     area_std = pstdev([frame.face_area_ratio for frame in face_frames]) if len(face_frames) > 1 else 0.0
     face_stability = clamp(1.0 - area_std / 0.08)
-    base_brightness = avg([frame.mean_hsv[2] for frame in baseline if frame.mean_hsv])
-    base_global_brightness = avg([frame.global_brightness for frame in baseline]) if baseline else 0.0
-    base_bgr_values = [frame.mean_bgr for frame in baseline if frame.mean_bgr]
-    base_bgr = (
-        tuple(avg([values[i] for values in base_bgr_values]) for i in range(3))
-        if base_bgr_values
-        else None
-    )
-    # Webcams at ~16 fps and auto-exposure add natural delay; center_crop needs more slack.
-    if DETECTOR_KIND == "center_crop":
-        latency_ok_ms = 300.0
-    else:
-        latency_ok_ms = 250.0
     texture_score = clamp(
         avg([frame.texture_var or 0.0 for frame in face_frames]) / 900.0 * 0.55
         + avg([frame.laplacian_var or 0.0 for frame in face_frames]) / 140.0 * 0.45
     )
 
-    responses = []
-    latencies = []
-    spatial_scores = []
-
-    for step in session.challenge:
-        window = [
-            frame
-            for frame in face_frames
-            if step["offset_ms"] <= frame.elapsed_ms <= step["offset_ms"] + step["duration_ms"] + 420
-        ]
-        if not window:
-            continue
-
-        flash_rgb = tuple(step["rgb"])
-        combined_deltas = [
-            flash_step_delta(
-                frame,
-                base_brightness=base_brightness,
-                base_global_brightness=base_global_brightness,
-                base_bgr=base_bgr,
-                flash_rgb=flash_rgb,
-            )
-            for frame in window
-        ]
-        peak_index = int(np.argmax(combined_deltas))
-        peak = window[peak_index]
-        responses.append(float(combined_deltas[peak_index]))
-        latencies.append(max(0.0, peak.elapsed_ms - step["offset_ms"]))
-
-        if baseline and peak.zones:
-            base_zones = []
-            for idx in range(len(peak.zones)):
-                base_zones.append(avg([frame.zones[idx] for frame in baseline if len(frame.zones) > idx]))
-            zone_deltas = [abs(value - base) for value, base in zip(peak.zones, base_zones)]
-            if zone_deltas:
-                spatial_scores.append(clamp((pstdev(zone_deltas) if len(zone_deltas) > 1 else 0.0) / max(avg(zone_deltas), 1.0)))
-
-    raw_response = avg(responses)
-    response_score = clamp(raw_response / 28.0)
-    mean_latency = avg(latencies) if latencies else None
-    latency_score = clamp(1.0 - max(0.0, (mean_latency or 999.0) - 50.0) / 240.0)
-    spatial_score = avg(spatial_scores)
-
-    live = sigmoid(
-        -2.1
-        + 2.35 * face_ratio
-        + 1.35 * face_stability
-        + 1.9 * response_score
-        + 1.25 * latency_score
-        + 0.85 * texture_score
-        + 0.7 * spatial_score
+    flash_results = [analyze_flash_step(face_frames, step) for step in session.challenge]
+    measurable = [item for item in flash_results if item["reason"] != "insufficient_frames"]
+    passed = [item for item in measurable if item["passed"]]
+    valid_flash_ratio = len(passed) / len(session.challenge)
+    response_score = avg([item["strength"] for item in measurable])
+    color_match_score = avg([item["color_match"] for item in measurable])
+    challenge_score = clamp(
+        0.55 * valid_flash_ratio
+        + 0.25 * response_score
+        + 0.20 * color_match_score
     )
+    valid_latencies = [item["latency_ms"] for item in passed if item["latency_ms"] is not None]
+    mean_latency = avg(valid_latencies) if valid_latencies else None
+
+    # Face/texture are supporting quality signals only. The randomized
+    # color challenge is mandatory and dominates the probability.
+    quality_score = clamp(
+        0.55 * face_ratio
+        + 0.25 * face_stability
+        + 0.20 * texture_score
+    )
+    live = clamp(0.08 + 0.78 * challenge_score + 0.14 * quality_score)
     reasons = []
 
-    if face_ratio >= 0.55:
+    if face_ratio >= 0.8:
         reasons.append("stable_face")
     else:
-        live *= 0.35
         reasons.append("face_not_stable")
 
-    if response_score >= 0.12:
-        reasons.append("flash_response_detected")
+    if len(measurable) < 4:
+        live = min(live, 0.49)
+        reasons.append("insufficient_flash_samples")
+    elif len(passed) >= 3 and valid_flash_ratio >= 0.6:
+        reasons.append("color_challenge_passed")
     else:
-        live *= 0.8
-        reasons.append("weak_flash_response")
-
-    if mean_latency is not None and mean_latency <= latency_ok_ms:
-        reasons.append("fast_flash_response")
-    elif mean_latency is not None and mean_latency <= latency_ok_ms + 80.0:
-        live *= 0.92
-        reasons.append("moderate_flash_latency")
-    else:
-        live *= 0.82
-        reasons.append("delayed_or_missing_flash_response")
+        live = min(live, 0.39)
+        reasons.append("color_challenge_failed")
 
     if DETECTOR_KIND == "center_crop":
         reasons.append("fallback_detector_center_crop")
-        live *= 0.9
+        live = min(live, 0.49)
 
     if texture_score >= 0.18:
         reasons.append("skin_texture_present")
     else:
         reasons.append("low_texture_detail")
 
-    if spatial_score >= 0.08:
-        reasons.append("natural_spatial_variation")
-    else:
-        reasons.append("flat_spatial_response")
-
     live = clamp(live)
-    verdict = "live" if live >= 0.72 else "spoof" if live <= 0.42 else "uncertain"
+    challenge_passed = (
+        len(measurable) >= 4
+        and len(passed) >= 3
+        and valid_flash_ratio >= 0.6
+        and color_match_score >= 0.70
+    )
+    verdict = (
+        "live"
+        if challenge_passed and face_ratio >= 0.8 and live >= 0.68
+        else "spoof"
+        if live <= 0.40
+        else "uncertain"
+    )
 
     return result(
         session,
@@ -504,12 +553,15 @@ def score(session: Session) -> dict:
             "face_found_ratio": face_ratio,
             "face_stability": face_stability,
             "mean_latency_ms": mean_latency,
-            "raw_flash_response": raw_response,
             "response_score": response_score,
-            "global_baseline_brightness": base_global_brightness,
+            "color_match_score": color_match_score,
+            "valid_flash_ratio": valid_flash_ratio,
+            "passed_flashes": len(passed),
+            "measurable_flashes": len(measurable),
+            "challenge_score": challenge_score,
+            "challenge_passed": challenge_passed,
             "texture_score": texture_score,
-            "spatial_score": spatial_score,
-            "latency_threshold_ms": latency_ok_ms,
+            "flash_results": flash_results,
         },
     )
 

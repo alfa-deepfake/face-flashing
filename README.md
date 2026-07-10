@@ -75,8 +75,14 @@ MediaPipe face model downloads automatically into `models/` (~1 MB).
 1. Server creates a session with 5 random color flashes (400–650 ms each).
 2. Browser captures ~16 fps and sends JPEG frames over WebSocket.
 3. Server detects face (MediaPipe → Haar cascade fallback → center crop).
-4. Scoring checks: face stability, flash color response, latency, skin texture, spatial variation.
-5. Result: `live` / `spoof` / `uncertain` + debug metrics.
+4. For every flash, scoring compares the face color immediately before the
+   flash with frames captured while that exact color is visible.
+5. A flash passes only when response strength, expected color direction, and
+   timing all match. At least 3 of 5 flashes must pass for a `live` verdict.
+6. Face stability and texture are supporting quality signals; they cannot
+   produce `live` without passing the randomized color challenge.
+7. Switching tabs or minimizing the browser cancels the check.
+8. Result: `live` / `spoof` / `uncertain` + per-flash debug metrics.
 
 ## API
 
