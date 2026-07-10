@@ -529,6 +529,53 @@ def result(session: Session, verdict: str, live: float, reasons: list[str], metr
     }
 
 
+@app.websocket("/ws/preview")
+async def preview_endpoint(websocket: WebSocket) -> None:
+    """Lightweight face bbox stream for camera preview overlay."""
+    await websocket.accept()
+    try:
+        while True:
+            message = json.loads(await websocket.receive_text())
+            if message.get("type") != "preview_frame":
+                continue
+
+            frame = decode_image(message["image"])
+            frame_h, frame_w = frame.shape[:2]
+            bbox = detect_face_bbox(frame)
+
+            if bbox is None:
+                await websocket.send_json(
+                    {
+                        "type": "face_bbox",
+                        "found": False,
+                        "frame_w": frame_w,
+                        "frame_h": frame_h,
+                        "detector_kind": DETECTOR_KIND,
+                    }
+                )
+                continue
+
+            x, y, w, h = bbox
+            await websocket.send_json(
+                {
+                    "type": "face_bbox",
+                    "found": True,
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h,
+                    "frame_w": frame_w,
+                    "frame_h": frame_h,
+                    "detector_kind": DETECTOR_KIND,
+                }
+            )
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close()
+
+
 @app.websocket("/ws/{session_id}")
 async def ws_endpoint(websocket: WebSocket, session_id: str) -> None:
     await websocket.accept()

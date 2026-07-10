@@ -84,6 +84,7 @@ MediaPipe face model downloads automatically into `models/` (~1 MB).
 |----------|-------------|
 | `GET /` | Web UI |
 | `POST /api/session` | Create liveness challenge |
+| `WS /ws/preview` | Preview: send frames, receive face bbox for overlay |
 | `WS /ws/{session_id}` | Stream frames, receive result |
 
 ## Git repository

@@ -43,6 +43,22 @@
         display: grid;
         place-items: center;
         background: #000;
+        overflow: hidden;
+      }
+
+      .camera-viewport {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        min-height: 560px;
+      }
+
+      .camera-viewport video {
+        width: 100%;
+        height: 100%;
+        min-height: 560px;
+        object-fit: cover;
+        transform: scaleX(-1);
       }
 
       video {
@@ -54,12 +70,21 @@
 
       .face-guide {
         position: absolute;
-        width: 230px;
-        height: 310px;
         border: 2px solid rgba(52, 211, 153, 0.9);
         border-radius: 48%;
         box-shadow: 0 0 48px rgba(52, 211, 153, 0.25);
         pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.15s ease;
+      }
+
+      .face-guide.visible {
+        opacity: 1;
+      }
+
+      .face-guide.missing {
+        border-color: rgba(248, 113, 113, 0.95);
+        box-shadow: 0 0 32px rgba(248, 113, 113, 0.25);
       }
 
       .side {
@@ -190,16 +215,19 @@
     </div>
     <main class="app">
       <section class="panel camera">
-        <video id="video" autoplay muted playsinline></video>
-        <div class="face-guide"></div>
+        <div class="camera-viewport">
+          <video id="video" autoplay muted playsinline></video>
+          <div id="faceGuide" class="face-guide"></div>
+        </div>
         <canvas id="canvas" hidden></canvas>
+        <canvas id="previewCanvas" hidden></canvas>
       </section>
 
       <aside class="panel side">
         <h1>Face Flashing MVP</h1>
         <p>
-          Нажми старт, дай доступ к камере, смотри в экран. Сайт покажет случайные
-          яркие вспышки, сервер проверит отклик лица и вернет вероятность подделки.
+          Дай доступ к камере — овал сам ляжет на лицо (детекция на сервере). Нажми старт,
+          смотри в экран: случайные вспышки, сервер проверит отклик и вернёт вероятность.
         </p>
 
         <div class="actions">
@@ -220,6 +248,9 @@
       const pipVideo = document.getElementById("pipVideo");
       const cameraPip = document.getElementById("cameraPip");
       const canvas = document.getElementById("canvas");
+      const previewCanvas = document.getElementById("previewCanvas");
+      const faceGuide = document.getElementById("faceGuide");
+      const cameraViewport = document.querySelector(".camera-viewport");
       const flash = document.getElementById("flash");
       const startButton = document.getElementById("start");
       const resetButton = document.getElementById("reset");
@@ -228,11 +259,18 @@
       const progressEl = document.getElementById("progress");
       const resultEl = document.getElementById("result");
 
+      const PREVIEW_WIDTH = 320;
+      const PREVIEW_HEIGHT = 240;
+      const PREVIEW_INTERVAL_MS = 180;
+
       let stream = null;
       let socket = null;
+      let previewSocket = null;
       let captureTimer = null;
+      let previewTimer = null;
       let raf = 0;
       let sessionFinished = false;
+      let faceDetected = false;
 
       function setStatus(text) {
         statusEl.textContent = text;
@@ -243,6 +281,107 @@
         return last ? last.offset_ms + last.duration_ms + 800 : session.baseline_ms;
       }
 
+      function coverLayout() {
+        const vw = video.videoWidth || PREVIEW_WIDTH;
+        const vh = video.videoHeight || PREVIEW_HEIGHT;
+        const cw = cameraViewport.clientWidth;
+        const ch = cameraViewport.clientHeight;
+        const scale = Math.max(cw / vw, ch / vh);
+        const dw = vw * scale;
+        const dh = vh * scale;
+        return {
+          vw,
+          vh,
+          scale,
+          offsetX: (cw - dw) / 2,
+          offsetY: (ch - dh) / 2,
+        };
+      }
+
+      function updateFaceGuide(message) {
+        if (!message.found) {
+          faceDetected = false;
+          faceGuide.classList.remove("visible");
+          faceGuide.classList.add("missing");
+          return;
+        }
+
+        faceDetected = true;
+        const padX = message.w * 0.12;
+        const padY = message.h * 0.16;
+        const bx = Math.max(0, message.x - padX);
+        const by = Math.max(0, message.y - padY);
+        const bw = Math.min(message.frame_w - bx, message.w + padX * 2);
+        const bh = Math.min(message.frame_h - by, message.h + padY * 2);
+
+        const layout = coverLayout();
+        const sx = layout.vw / message.frame_w;
+        const sy = layout.vh / message.frame_h;
+
+        const px = bx * sx;
+        const py = by * sy;
+        const pw = bw * sx;
+        const ph = bh * sy;
+
+        const left = layout.offsetX + (layout.vw - px - pw) * layout.scale;
+        const top = layout.offsetY + py * layout.scale;
+        const width = pw * layout.scale;
+        const height = ph * layout.scale;
+
+        faceGuide.style.left = `${left}px`;
+        faceGuide.style.top = `${top}px`;
+        faceGuide.style.width = `${width}px`;
+        faceGuide.style.height = `${height}px`;
+        faceGuide.classList.add("visible");
+        faceGuide.classList.remove("missing");
+      }
+
+      function stopPreviewTracking() {
+        if (previewTimer) clearInterval(previewTimer);
+        previewTimer = null;
+        if (previewSocket) previewSocket.close();
+        previewSocket = null;
+      }
+
+      function startPreviewTracking() {
+        stopPreviewTracking();
+        if (!stream || !video.videoWidth) return;
+
+        const previewCtx = previewCanvas.getContext("2d");
+        previewCanvas.width = PREVIEW_WIDTH;
+        previewCanvas.height = PREVIEW_HEIGHT;
+
+        const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
+        previewSocket = new WebSocket(`${wsProtocol}://${location.host}/ws/preview`);
+
+        previewSocket.onmessage = (event) => {
+          const message = JSON.parse(event.data);
+          if (message.type === "face_bbox") {
+            updateFaceGuide(message);
+          }
+        };
+
+        previewSocket.onopen = () => {
+          previewTimer = setInterval(() => {
+            if (!previewSocket || previewSocket.readyState !== WebSocket.OPEN) return;
+            if (!video.videoWidth) return;
+            previewCtx.drawImage(video, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+            previewSocket.send(
+              JSON.stringify({
+                type: "preview_frame",
+                image: previewCanvas.toDataURL("image/jpeg", 0.7),
+              }),
+            );
+          }, PREVIEW_INTERVAL_MS);
+        };
+      }
+
+      window.addEventListener("resize", () => {
+        if (faceGuide.classList.contains("visible") && faceDetected) {
+          // Re-layout on resize; next bbox message will fix position.
+        }
+      });
+
       async function startCamera() {
         if (stream) {
           video.srcObject = stream;
@@ -250,6 +389,7 @@
           cameraPip.hidden = false;
           await video.play().catch(() => undefined);
           await pipVideo.play().catch(() => undefined);
+          startPreviewTracking();
           return;
         }
 
@@ -262,9 +402,11 @@
         cameraPip.hidden = false;
         await video.play();
         await pipVideo.play();
+        startPreviewTracking();
       }
 
       function stopCamera() {
+        stopPreviewTracking();
         if (!stream) return;
         for (const track of stream.getTracks()) {
           track.stop();
@@ -273,6 +415,8 @@
         video.srcObject = null;
         pipVideo.srcObject = null;
         cameraPip.hidden = true;
+        faceGuide.classList.remove("visible", "missing");
+        faceDetected = false;
       }
 
       function runFlashes(session, startedAt) {
@@ -363,6 +507,7 @@
         cameraPip.hidden = !stream;
         startButton.disabled = false;
         document.exitFullscreen?.().catch(() => undefined);
+        if (stream) startPreviewTracking();
       }
 
       startButton.addEventListener("click", async () => {
@@ -378,6 +523,7 @@
           cameraPip.hidden = false;
 
           setStatus("Создание challenge...");
+          stopPreviewTracking();
           const session = await fetch("/api/session", { method: "POST" }).then((res) => res.json());
           const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
           socket = new WebSocket(`${wsProtocol}://${location.host}/ws/${session.session_id}`);
@@ -435,7 +581,7 @@
       });
 
       startCamera()
-        .then(() => setStatus("Камера готова. Нажмите «Начать проверку»"))
+        .then(() => setStatus("Камера готова. Наведите лицо — овал подстроится сам"))
         .catch((error) => {
           errorEl.textContent =
             error instanceof Error
